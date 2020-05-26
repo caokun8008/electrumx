@@ -12,17 +12,24 @@
 import asyncio
 import time
 
-from aiorpcx import TaskGroup, run_in_thread, CancelledError
+from aiorpcx import TaskGroup, run_in_thread
 
 import electrumx
 from electrumx.server.daemon import DaemonError
 from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
 from electrumx.lib.script import is_unspendable_legacy, is_unspendable_genesis
 from electrumx.lib.util import (
-    chunks, class_logger, pack_le_uint32, pack_le_uint64, unpack_le_uint64
+    chunks, class_logger, pack_le_uint32, pack_le_uint64, unpack_le_uint32
 )
 from electrumx.server.db import FlushData
-
+# add by ck 2020-5-21
+import binascii
+import socket
+import json
+from jsonrpc.jsonrpc2 import JSONRPC20Request, JSONRPC20Response
+from socket import error
+import plyvel
+import datetime
 
 class Prefetcher(object):
     '''Prefetches blocks (in the forward direction only).'''
@@ -187,9 +194,6 @@ class BlockProcessor(object):
         # is consistent with self.height
         self.state_lock = asyncio.Lock()
 
-        # Signalled after backing up during a reorg
-        self.backed_up_event = asyncio.Event()
-
     async def run_in_thread_with_lock(self, func, *args):
         # Run in a thread to prevent blocking.  Shielded so that
         # cancellations from shutdown don't lose work - when the task
@@ -273,8 +277,6 @@ class BlockProcessor(object):
             await self.run_in_thread_with_lock(flush_backup)
             last -= len(raw_blocks)
         await self.prefetcher.reset_height(self.height)
-        self.backed_up_event.set()
-        self.backed_up_event.clear()
 
     async def reorg_hashes(self, count):
         '''Return a pair (start, last, hashes) of blocks to back up during a
@@ -407,6 +409,55 @@ class BlockProcessor(object):
         self.headers.extend(headers)
         self.tip = self.coin.header_hash(headers[-1])
 
+    # 判断是否已过有效期 add by ck 2020-5-22
+    def date_isvalid(self,timestr):
+        # 获取当前时间日期
+        nowTime_str = datetime.datetime.now().strftime('%Y-%m-%d')
+        # mktime参数为struc_time,将日期转化为秒，
+        e_time = time.mktime(time.strptime(nowTime_str, "%Y-%m-%d"))
+        s_time = time.mktime(time.strptime(timestr, '%Y-%m-%d'))
+        # 日期转化为int比较
+        diff = int(s_time) - int(e_time)
+        if diff >= 0:
+            return True
+        else:
+            return False
+
+    # 判断地址hashx是否有效 add by ck 2020-5-22
+    def hashx_isvalid(self,hashx):
+        try:
+            db = plyvel.DB('/data/electrumx-coins/bitcoin/electrumx/address',create_if_missing=True)
+        except Exception as e:
+            print('exceptin e = {}'.format(e))
+        get_expir = db.get(hashx)
+        db.close()
+        if get_expir:
+            # 是否超出有效期 bytearray(b'2020-06-06')
+            expir_str = get_expir.decode('utf-8')
+            date_is_valid = self.date_isvalid(expir_str)
+            if not date_is_valid:
+                return False
+            else:
+                return True
+        else:
+            return False    
+
+    # 发送数据 add by ck 2020-5-23
+    def send_data_to_server(self,send_data):
+        ip = self.env.push_dist_ip
+        port = int(self.env.push_dist_port)
+        # 构造发送数据
+        send_start_line = "HTTP/1.1 200 OK\r\n"
+        send_headers = "Pushing txid to Server\r\n"
+
+        send_body = str(send_data)
+        send_all = send_start_line + send_headers + "\r\n" + send_body + "\r\n"
+
+        mbsocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        mbsocket.connect((ip, port))
+        mbsocket.send(bytes(send_all, "utf-8"))
+        mbsocket.close()
+
     def advance_txs(self, txs, is_unspendable):
         self.tx_hashes.append(b''.join(tx_hash for tx, tx_hash in txs))
 
@@ -423,27 +474,88 @@ class BlockProcessor(object):
         to_le_uint32 = pack_le_uint32
         to_le_uint64 = pack_le_uint64
 
+        tx_n = 0
         for tx, tx_hash in txs:
             hashXs = []
             append_hashX = hashXs.append
-            tx_numb = to_le_uint64(tx_num)[:5]
+            tx_numb = to_le_uint32(tx_num)
+            txid = binascii.hexlify(tx_hash[::-1]).decode('utf-8')
+            tx_n += 1
+            self.logger.info('[advance_txs] 解析新交易：tx_hash = {}'.format(txid))
 
             # Spend the inputs
+            txin_n = 0
             for txin in tx.inputs:
                 if txin.is_generation():
                     continue
                 cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
+                # add by ck 2020-5-23
+                txin_n += 1
+                self.logger.info('[advance_txs]解析一个新vin：{}'.format(txin_n))
+                vin_pk1 = binascii.hexlify(txin.script).decode('utf-8')
+                vin_hashx = cache_value[:-12]
+
+                if self.hashx_isvalid(vin_hashx):
+                    vin_pk = ''
+                    need_send = False
+                    vin_address = ''
+                    if txin.script:
+                        vin_script = binascii.hexlify(txin.script).decode('utf-8')
+                        if len(vin_script) == 212 or len(vin_script) == 214:
+                            vin_pk = vin_script[-66:]
+                            need_send = True
+                        elif len(vin_script) == 434 or len(vin_script) == 436:
+                            vin_pk = vin_script[-70:-4]
+                            need_send = True
+                        elif len(vin_script) == 278:
+                            vin_pk = vin_script[-130:]
+                            need_send = True
+                    if need_send:
+                        # 开始组包发送
+                        vin_address = self.coin.P2PKH_address_from_pubkey(bytes.fromhex(vin_pk))
+                        self.logger.info('[advance_txs] vin_address = {}'.format(vin_address))
+                        send_data = '{\"chainid\":1,\"cointype\":1,\"code\":\"\",\"symbol\":\"BTC\",\"address\":\"' + vin_address + '\",\"txid\":\"' +txid + '\",\"trade_type\":1}'
+                        self.send_data_to_server(send_data)
+                        self.logger.info('[advance_txs] 推送交易：{}'.format(send_data))
+                # add by ck end
+
                 undo_info_append(cache_value)
-                append_hashX(cache_value[:-13])
+                append_hashX(cache_value[:-12])
 
             # Add the new UTXOs
+            txout_n = 0
             for idx, txout in enumerate(tx.outputs):
                 # Ignore unspendable outputs
                 if is_unspendable(txout.pk_script):
                     continue
 
+                # add by ck 2020-5-23
+                txout_n += 1
+                self.logger.info('[advance_txs]解析一个新vout：{}'.format(txout_n))
+               
                 # Get the hashX
                 hashX = script_hashX(txout.pk_script)
+                if self.hashx_isvalid(hashX):
+                    need_send_vout = False
+                    vout_pk_hash60_str = ''
+                    vout_address = ''
+                    if txout.pk_script:
+                        vout_pk_hash60 = binascii.hexlify(txout.pk_script).decode('utf-8')
+                        if len(vout_pk_hash60) == 50:
+                            vout_pk_hash60_str = vout_pk_hash60[6:46]
+                            need_send_vout = True
+                        if len(vout_pk_hash60) == 46:
+                            vout_pk_hash60_str = vout_pk_hash60[4:44]
+                            need_send_vout = True
+                    if need_send_vout:
+                        # 开始组包发送
+                        vout_address = self.coin.P2PKH_address_from_hash160(bytes.fromhex(vout_pk_hash60_str))
+                        self.logger.info('[advance_txs] vout_address = {}'.format(vout_address))
+                        send_data = '{\"chainid\":1,\"cointype\":1,\"code\":\"\",\"symbol\":\"BTC\",\"address\":\"' + vout_address + '\",\"txid\":\"' + txid + '\",\"trade_type\":2}'
+                        self.send_data_to_server(send_data)
+                        self.logger.info('[advance_txs] 推送交易：{}'.format(send_data))
+                # add by ck end
+                
                 append_hashX(hashX)
                 put_utxo(tx_hash + to_le_uint32(idx),
                          hashX + tx_numb + to_le_uint64(txout.value))
@@ -502,7 +614,7 @@ class BlockProcessor(object):
         spend_utxo = self.spend_utxo
         script_hashX = self.coin.hashX_from_script
         touched = self.touched
-        undo_entry_len = 13 + HASHX_LEN
+        undo_entry_len = 12 + HASHX_LEN
 
         for tx, tx_hash in reversed(txs):
             for idx, txout in enumerate(tx.outputs):
@@ -514,7 +626,7 @@ class BlockProcessor(object):
                 # Get the hashX
                 hashX = script_hashX(txout.pk_script)
                 cache_value = spend_utxo(tx_hash, idx)
-                touched.add(cache_value[:-13])
+                touched.add(cache_value[:-12])
 
             # Restore the inputs
             for txin in reversed(tx.inputs):
@@ -523,7 +635,7 @@ class BlockProcessor(object):
                 n -= undo_entry_len
                 undo_item = undo_info[n:n + undo_entry_len]
                 put_utxo(txin.prev_hash + pack_le_uint32(txin.prev_idx), undo_item)
-                touched.add(undo_item[:-13])
+                touched.add(undo_item[:-12])
 
         assert n == 0
         self.tx_count -= len(txs)
@@ -539,9 +651,9 @@ class BlockProcessor(object):
     binary keys and values.
 
       Key:    TX_HASH + TX_IDX           (32 + 4 = 36 bytes)
-      Value:  HASHX + TX_NUM + VALUE     (11 + 5 + 8 = 24 bytes)
+      Value:  HASHX + TX_NUM + VALUE     (11 + 4 + 8 = 23 bytes)
 
-    That's 60 bytes of raw data in-memory.  Python dictionary overhead
+    That's 59 bytes of raw data in-memory.  Python dictionary overhead
     means each entry actually uses about 205 bytes of memory.  So
     almost 5 million UTXOs can fit in 1GB of RAM.  There are
     approximately 42 million UTXOs on bitcoin mainnet at height
@@ -604,10 +716,10 @@ class BlockProcessor(object):
                       in self.db.utxo_db.iterator(prefix=prefix)}
 
         for hdb_key, hashX in candidates.items():
-            tx_num_packed = hdb_key[-5:]
+            tx_num_packed = hdb_key[-4:]
 
             if len(candidates) > 1:
-                tx_num, = unpack_le_uint64(tx_num_packed + bytes(3))
+                tx_num, = unpack_le_uint32(tx_num_packed)
                 hash, _height = self.db.fs_tx_hash(tx_num)
                 if hash != tx_hash:
                     assert hash is not None  # Should always be found
@@ -615,7 +727,7 @@ class BlockProcessor(object):
 
             # Key: b'u' + address_hashX + tx_idx + tx_num
             # Value: the UTXO value as a 64-bit unsigned integer
-            udb_key = b'u' + hashX + hdb_key[-9:]
+            udb_key = b'u' + hashX + hdb_key[-8:]
             utxo_value_packed = self.db.utxo_db.get(udb_key)
             if utxo_value_packed:
                 # Remove both entries for this UTXO
@@ -680,9 +792,8 @@ class BlockProcessor(object):
             async with TaskGroup() as group:
                 await group.spawn(self.prefetcher.main_loop(self.height))
                 await group.spawn(self._process_prefetched_blocks())
-        # Don't flush for arbitrary exceptions as they might be a cause or consequence of
-        # corrupted data
-        except CancelledError:
+        finally:
+            # Shut down block processing
             self.logger.info('flushing to DB for a clean shutdown...')
             await self.flush(True)
 
@@ -760,7 +871,7 @@ class LTORBlockProcessor(BlockProcessor):
         # Add the new UTXOs
         for (tx, tx_hash), hashXs in zip(txs, hashXs_by_tx):
             add_hashXs = hashXs.add
-            tx_numb = to_le_uint64(tx_num)[:5]
+            tx_numb = to_le_uint32(tx_num)
 
             for idx, txout in enumerate(tx.outputs):
                 # Ignore unspendable outputs
@@ -783,7 +894,7 @@ class LTORBlockProcessor(BlockProcessor):
                     continue
                 cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
                 undo_info_append(cache_value)
-                add_hashXs(cache_value[:-13])
+                add_hashXs(cache_value[:-12])
 
         # Update touched set for notifications
         for hashXs in hashXs_by_tx:
@@ -807,7 +918,7 @@ class LTORBlockProcessor(BlockProcessor):
         spend_utxo = self.spend_utxo
         script_hashX = self.coin.hashX_from_script
         add_touched = self.touched.add
-        undo_entry_len = 13 + HASHX_LEN
+        undo_entry_len = 12 + HASHX_LEN
 
         # Restore coins that had been spent
         # (may include coins made then spent in this block)
@@ -818,7 +929,7 @@ class LTORBlockProcessor(BlockProcessor):
                     continue
                 undo_item = undo_info[n:n + undo_entry_len]
                 put_utxo(txin.prev_hash + pack_le_uint32(txin.prev_idx), undo_item)
-                add_touched(undo_item[:-13])
+                add_touched(undo_item[:-12])
                 n += undo_entry_len
 
         assert n == len(undo_info)
@@ -834,6 +945,6 @@ class LTORBlockProcessor(BlockProcessor):
                 # Get the hashX
                 hashX = script_hashX(txout.script)
                 cache_value = spend_utxo(tx_hash, idx)
-                add_touched(cache_value[:-13])
+                add_touched(cache_value[:-12])
 
         self.tx_count -= len(txs)
