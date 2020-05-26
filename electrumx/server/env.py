@@ -50,6 +50,10 @@ class Env(EnvBase):
             network = self.default('NET', 'mainnet').strip()
             self.coin = Coin.lookup_coin_class(coin_name, network)
 
+        #推送目标：
+        self.push_dist_ip = self.required('PUSH_DIST_IP')
+        self.push_dist_port = self.required('PUSH_DIST_PORT')
+
         # Peer discovery
 
         self.peer_discovery = self.peer_discovery_enum()

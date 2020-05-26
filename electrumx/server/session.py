@@ -568,7 +568,7 @@ class SessionManager:
 
     async def serve(self, notifications, event):
         '''Start the RPC server if enabled.  When the event is triggered,
-        start TCP and SSL servers.'''
+        start TCP and SSL servers. 如果启用，请启动RPC服务器。 触发事件后，启动TCP和SSL服务器。'''
         try:
             await self._start_servers(service for service in self.env.services
                                       if service.protocol == 'rpc')
@@ -745,9 +745,11 @@ class SessionManager:
         return result, cost
 
     async def _notify_sessions(self, height, touched):
-        '''Notify sessions about height changes and touched addresses.'''
+        '''Notify sessions about height changes and touched addresses.
+        通知会话有关高度变化和触摸地址的信息。'''
         # Invalidate our height-based caches in case of a reorg.  Increment the cache
         # counter so that our invalidation of them isn't concurrently itself overwritten
+        # 如果发生重组，会使我们基于高度的缓存无效。 增加缓存计数器，以使我们对它们的无效不会同时被覆盖
         self._cache_counter += 1
         for cache in (self._tx_hashes_cache, self._merkle_cache):
             for key in range(height, self.db.db_height + 1):
@@ -957,6 +959,7 @@ class ElectrumX(SessionBase):
     async def notify(self, touched, height_changed):
         '''Notify the client about changes to touched addresses (from mempool
         updates or new blocks) and height.
+        通知客户端有关触摸地址（来自内存池更新或新块）和高度的更改。
         '''
         if height_changed and self.subscribe_headers:
             args = (await self.subscribe_headers_result(), )
@@ -1045,7 +1048,7 @@ class ElectrumX(SessionBase):
 
     async def subscription_address_status(self, hashX):
         '''As for address_status, but if it can't be calculated the subscription is
-        discarded.'''
+        discarded.至于address_status，但如果无法计算，则订阅将被丢弃。'''
         try:
             return await self.address_status(hashX)
         except RPCError:
@@ -1082,7 +1085,9 @@ class ElectrumX(SessionBase):
 
     async def scripthash_get_balance(self, scripthash):
         '''Return the confirmed and unconfirmed balance of a scripthash.'''
-        hashX = scripthash_to_hashX(scripthash)
+        #hashX = scripthash_to_hashX(scripthash)
+        coin = self.env.coin
+        hashX = coin.address_to_hashX(scripthash)
         return await self.get_balance(hashX)
 
     async def unconfirmed_history(self, hashX):
@@ -1105,7 +1110,9 @@ class ElectrumX(SessionBase):
 
     async def scripthash_get_history(self, scripthash):
         '''Return the confirmed and unconfirmed history of a scripthash.'''
-        hashX = scripthash_to_hashX(scripthash)
+        #hashX = scripthash_to_hashX(scripthash)
+        coin = self.env.coin
+        hashX = coin.address_to_hashX(scripthash)
         return await self.confirmed_and_unconfirmed_history(hashX)
 
     async def scripthash_get_mempool(self, scripthash):
@@ -1115,20 +1122,26 @@ class ElectrumX(SessionBase):
 
     async def scripthash_listunspent(self, scripthash):
         '''Return the list of UTXOs of a scripthash.'''
-        hashX = scripthash_to_hashX(scripthash)
+        #hashX = scripthash_to_hashX(scripthash)
+        coin = self.env.coin
+        hashX = coin.address_to_hashX(scripthash)
         return await self.hashX_listunspent(hashX)
 
     async def scripthash_subscribe(self, scripthash):
         '''Subscribe to a script hash.
 
         scripthash: the SHA256 hash of the script to subscribe to'''
-        hashX = scripthash_to_hashX(scripthash)
+        #hashX = scripthash_to_hashX(scripthash)
+        coin = self.env.coin
+        hashX = coin.address_to_hashX(scripthash)
         return await self.hashX_subscribe(hashX, scripthash)
 
     async def scripthash_unsubscribe(self, scripthash):
         '''Unsubscribe from a script hash.'''
         self.bump_cost(0.1)
-        hashX = scripthash_to_hashX(scripthash)
+        #hashX = scripthash_to_hashX(scripthash)
+        coin = self.env.coin
+        hashX = coin.address_to_hashX(scripthash)
         return self.unsubscribe_hashX(hashX) is not None
 
     async def _merkle_proof(self, cp_height, height):
