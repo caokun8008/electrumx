@@ -22,7 +22,14 @@ from electrumx.lib.util import (
     chunks, class_logger, pack_le_uint32, pack_le_uint64, unpack_le_uint32
 )
 from electrumx.server.db import FlushData
-
+# add by ck 2020-5-21
+import binascii
+import socket
+import json
+from jsonrpc.jsonrpc2 import JSONRPC20Request, JSONRPC20Response
+from socket import error
+import plyvel
+import datetime
 
 class Prefetcher(object):
     '''Prefetches blocks (in the forward direction only).'''
@@ -402,6 +409,55 @@ class BlockProcessor(object):
         self.headers.extend(headers)
         self.tip = self.coin.header_hash(headers[-1])
 
+    # 判断是否已过有效期 add by ck 2020-5-22
+    def date_isvalid(self,timestr):
+        # 获取当前时间日期
+        nowTime_str = datetime.datetime.now().strftime('%Y-%m-%d')
+        # mktime参数为struc_time,将日期转化为秒，
+        e_time = time.mktime(time.strptime(nowTime_str, "%Y-%m-%d"))
+        s_time = time.mktime(time.strptime(timestr, '%Y-%m-%d'))
+        # 日期转化为int比较
+        diff = int(s_time) - int(e_time)
+        if diff >= 0:
+            return True
+        else:
+            return False
+
+    # 判断地址hashx是否有效 add by ck 2020-5-22
+    def hashx_isvalid(self,hashx):
+        try:
+            db = plyvel.DB('/data/electrumx-coins/bitcoin/electrumx/address',create_if_missing=True)
+        except Exception as e:
+            print('exceptin e = {}'.format(e))
+        get_expir = db.get(hashx)
+        db.close()
+        if get_expir:
+            # 是否超出有效期 bytearray(b'2020-06-06')
+            expir_str = get_expir.decode('utf-8')
+            date_is_valid = self.date_isvalid(expir_str)
+            if not date_is_valid:
+                return False
+            else:
+                return True
+        else:
+            return False    
+
+    # 发送数据 add by ck 2020-5-23
+    def send_data_to_server(self,send_data):
+        ip = self.env.push_dist_ip
+        port = int(self.env.push_dist_port)
+        # 构造发送数据
+        send_start_line = "HTTP/1.1 200 OK\r\n"
+        send_headers = "Pushing txid to Server\r\n"
+
+        send_body = str(send_data)
+        send_all = send_start_line + send_headers + "\r\n" + send_body + "\r\n"
+
+        mbsocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        mbsocket.connect((ip, port))
+        mbsocket.send(bytes(send_all, "utf-8"))
+        mbsocket.close()
+
     def advance_txs(self, txs, is_unspendable):
         self.tx_hashes.append(b''.join(tx_hash for tx, tx_hash in txs))
 
@@ -418,27 +474,88 @@ class BlockProcessor(object):
         to_le_uint32 = pack_le_uint32
         to_le_uint64 = pack_le_uint64
 
+        tx_n = 0
         for tx, tx_hash in txs:
             hashXs = []
             append_hashX = hashXs.append
             tx_numb = to_le_uint32(tx_num)
+            txid = binascii.hexlify(tx_hash[::-1]).decode('utf-8')
+            tx_n += 1
+            self.logger.info('[advance_txs] 解析新交易：tx_hash = {}'.format(txid))
 
             # Spend the inputs
+            txin_n = 0
             for txin in tx.inputs:
                 if txin.is_generation():
                     continue
                 cache_value = spend_utxo(txin.prev_hash, txin.prev_idx)
+                # add by ck 2020-5-23
+                txin_n += 1
+                self.logger.info('[advance_txs]解析一个新vin：{}'.format(txin_n))
+                vin_pk1 = binascii.hexlify(txin.script).decode('utf-8')
+                vin_hashx = cache_value[:-12]
+
+                if self.hashx_isvalid(vin_hashx):
+                    vin_pk = ''
+                    need_send = False
+                    vin_address = ''
+                    if txin.script:
+                        vin_script = binascii.hexlify(txin.script).decode('utf-8')
+                        if len(vin_script) == 212 or len(vin_script) == 214:
+                            vin_pk = vin_script[-66:]
+                            need_send = True
+                        elif len(vin_script) == 434 or len(vin_script) == 436:
+                            vin_pk = vin_script[-70:-4]
+                            need_send = True
+                        elif len(vin_script) == 278:
+                            vin_pk = vin_script[-130:]
+                            need_send = True
+                    if need_send:
+                        # 开始组包发送
+                        vin_address = self.coin.P2PKH_address_from_pubkey(bytes.fromhex(vin_pk))
+                        self.logger.info('[advance_txs] vin_address = {}'.format(vin_address))
+                        send_data = '{\"chainid\":1,\"cointype\":1,\"code\":\"\",\"symbol\":\"BTC\",\"address\":\"' + vin_address + '\",\"txid\":\"' +txid + '\",\"trade_type\":1}'
+                        self.send_data_to_server(send_data)
+                        self.logger.info('[advance_txs] 推送交易：{}'.format(send_data))
+                # add by ck end
+
                 undo_info_append(cache_value)
                 append_hashX(cache_value[:-12])
 
             # Add the new UTXOs
+            txout_n = 0
             for idx, txout in enumerate(tx.outputs):
                 # Ignore unspendable outputs
                 if is_unspendable(txout.pk_script):
                     continue
 
+                # add by ck 2020-5-23
+                txout_n += 1
+                self.logger.info('[advance_txs]解析一个新vout：{}'.format(txout_n))
+               
                 # Get the hashX
                 hashX = script_hashX(txout.pk_script)
+                if self.hashx_isvalid(hashX):
+                    need_send_vout = False
+                    vout_pk_hash60_str = ''
+                    vout_address = ''
+                    if txout.pk_script:
+                        vout_pk_hash60 = binascii.hexlify(txout.pk_script).decode('utf-8')
+                        if len(vout_pk_hash60) == 50:
+                            vout_pk_hash60_str = vout_pk_hash60[6:46]
+                            need_send_vout = True
+                        if len(vout_pk_hash60) == 46:
+                            vout_pk_hash60_str = vout_pk_hash60[4:44]
+                            need_send_vout = True
+                    if need_send_vout:
+                        # 开始组包发送
+                        vout_address = self.coin.P2PKH_address_from_hash160(bytes.fromhex(vout_pk_hash60_str))
+                        self.logger.info('[advance_txs] vout_address = {}'.format(vout_address))
+                        send_data = '{\"chainid\":1,\"cointype\":1,\"code\":\"\",\"symbol\":\"BTC\",\"address\":\"' + vout_address + '\",\"txid\":\"' + txid + '\",\"trade_type\":2}'
+                        self.send_data_to_server(send_data)
+                        self.logger.info('[advance_txs] 推送交易：{}'.format(send_data))
+                # add by ck end
+                
                 append_hashX(hashX)
                 put_utxo(tx_hash + to_le_uint32(idx),
                          hashX + tx_numb + to_le_uint64(txout.value))
