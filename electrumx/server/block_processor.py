@@ -426,7 +426,7 @@ class BlockProcessor(object):
     # 判断地址hashx是否有效 add by ck 2020-5-22
     def hashx_isvalid(self,hashx):
         try:
-            db = plyvel.DB('/data/electrumx-coins/bitcoin/electrumx/address',create_if_missing=True)
+            db = plyvel.DB(self.env.db_dir+'/address',create_if_missing=True)
         except Exception as e:
             print('exceptin e = {}'.format(e))
         get_expir = db.get(hashx)
